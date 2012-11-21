@@ -55,6 +55,7 @@ Risk Report
 import logbook
 import datetime
 import math
+import bisect
 import numpy as np
 import numpy.linalg as la
 from zipline.utils.date_utils import epoch_now
@@ -321,26 +322,54 @@ class RiskMetricsBase(object):
         else:
             self.treasury_duration = '30year'
 
-        one_day = datetime.timedelta(days=1)
+        # in case end date is not a trading day, search for the next or
+        # previous market day for an interest rate.  choose next in a tie.
+        search_day = None
 
-        curve = None
-        # in case end date is not a trading day, search for the next market
-        # day for an interest rate
-        for i in xrange(7):
-            if (self.end_date + i * one_day) in self.treasury_curves:
-                curve = self.treasury_curves[self.end_date + i * one_day]
-                self.treasury_curve = curve
-                rate = self.treasury_curve[self.treasury_duration]
-                # 1month note data begins in 8/2001,
-                # so we can use 3month instead.
-                if rate is None and self.treasury_duration == '1month':
-                    rate = self.treasury_curve['3month']
+        if self.end_date in self.treasury_curves:
+            search_day = self.end_date
+        else:
+            search_days = self.treasury_curves.keys()
+            next_day = prev_day = None
 
-                if rate is not None:
-                    return rate * (td.days + 1) / 365
+            # Find leftmost item greater than or equal to end_date
+            i = bisect.bisect_left(search_days, self.end_date)
+            if i != len(search_days):
+                next_day = search_days[i]
+            if i:
+                prev_day = search_days[i - 1]
 
-        message = "no rate for end date = {dt} and term = {term}. Check \
-        that date doesn't exceed treasury history range."
+            def dist(dt):
+                tdd = self.trading_environment.\
+                    trading_day_distance(self.end_date, dt)
+                return tdd if tdd >= 0 else -1 * tdd + .5  # prev is 'farther'
+
+            if next_day and prev_day:
+                search_day = min(next_day, prev_day, key=dist)
+            else:
+                search_day = next_day or prev_day
+
+            if search_day and dist(search_day) > 1:
+                message = "No rate within 1 trading day of end date = {dt} \
+and term = {term}. Check that date doesn't exceed treasury history range."
+                message = message.format(dt=self.end_date,
+                                         term=self.treasury_duration)
+                log.warn(message)
+
+        if search_day:
+            curve = self.treasury_curves[search_day]
+            self.treasury_curve = curve
+            rate = self.treasury_curve[self.treasury_duration]
+            # 1month note data begins in 8/2001,
+            # so we can use 3month instead.
+            if rate is None and self.treasury_duration == '1month':
+                rate = self.treasury_curve['3month']
+
+            if rate is not None:
+                return rate * (td.days + 1) / 365
+
+        message = "No rate for end date = {dt} and term = {term}. Check \
+that date doesn't exceed treasury history range."
         message = message.format(
             dt=self.end_date,
             term=self.treasury_duration
@@ -396,8 +425,17 @@ class RiskMetricsIterative(RiskMetricsBase):
 
         self.end_date += datetime.timedelta(hours=24)
 
-        while not self.trading_environment.is_trading_day(self.end_date):
-            self.end_date += datetime.timedelta(hours=24)
+        if not self.trading_environment.is_trading_day(self.end_date):
+            next_trading_day = \
+                self.trading_environment.next_trading_day(self.end_date)
+
+            if next_trading_day:
+                self.end_date = next_trading_day
+            else:
+                message = "No trading data on or after {dt}. Check \
+that date doesn't exceed benchmark history range."
+                message = message.format(dt=self.end_date)
+                raise Exception(message)
 
         self.end_date = self.end_date.replace(hour=0, minute=0, second=0)
 
@@ -408,7 +446,7 @@ class RiskMetricsIterative(RiskMetricsBase):
 
         if(len(self.benchmark_returns) != len(self.algorithm_returns)):
             message = "Mismatch between benchmark_returns ({bm_count}) and \
-            algorithm_returns ({algo_count}) in range {start} : {end}"
+algorithm_returns ({algo_count}) in range {start} : {end}"
             message = message.format(
                 bm_count=len(self.benchmark_returns),
                 algo_count=len(self.algorithm_returns),
